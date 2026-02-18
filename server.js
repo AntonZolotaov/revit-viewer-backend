@@ -20,7 +20,7 @@ app.get("/", (req, res) => {
   res.send("Revit Viewer Backend is running");
 });
 
-// Debug route (temporary)
+// Debug route
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: ["GET /", "GET /api/auth/token", "POST /api/ai"]
@@ -65,38 +65,49 @@ app.get("/api/auth/token", async (req, res) => {
   }
 });
 
-// Gemini AI endpoint
+// =============================
+// GEMINI AI ENDPOINT (FIXED)
+// =============================
 app.post("/api/ai", async (req, res) => {
   try {
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
     if (!GEMINI_API_KEY) {
       return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
     }
 
-    const { text, selection } = req.body;
+    const { text, selection } = req.body || {};
+
     if (!text) {
       return res.status(400).json({ error: "Missing text field" });
     }
 
     const prompt = `
-You are a BIM assistant for Autodesk APS Viewer.
+You are a BIM assistant integrated into Autodesk APS Viewer.
 
 User question:
 ${text}
 
-Selected elements:
+Selected element data (JSON):
 ${JSON.stringify(selection || null, null, 2)}
 
-Reply clearly and concisely.
+Respond clearly, concisely, and professionally.
 `;
 
+    // ✅ FIXED ENDPOINT + MODEL
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json"
+        },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }]
+          contents: [
+            {
+              parts: [{ text: prompt }]
+            }
+          ]
         })
       }
     );
@@ -117,7 +128,10 @@ Reply clearly and concisely.
     res.json({ answer });
 
   } catch (err) {
-    res.status(500).json({ error: "AI request failed", details: String(err) });
+    res.status(500).json({
+      error: "AI request failed",
+      details: String(err)
+    });
   }
 });
 
