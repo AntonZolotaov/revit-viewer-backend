@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "2mb" }));
 
-// ✅ Manual CORS
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -15,19 +15,19 @@ app.use((req, res, next) => {
   next();
 });
 
-// ✅ Health check
+// Health check
 app.get("/", (req, res) => {
   res.send("Revit Viewer Backend is running");
 });
 
-// ✅ Debug route (temporary)
+// Debug route
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: ["GET /", "GET /api/auth/token", "POST /api/ai"],
   });
 });
 
-// ✅ APS Token endpoint
+// APS Token endpoint
 app.get("/api/auth/token", async (req, res) => {
   try {
     const APS_CLIENT_ID = process.env.APS_CLIENT_ID;
@@ -54,10 +54,7 @@ app.get("/api/auth/token", async (req, res) => {
     );
 
     const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json(data);
-    }
+    if (!response.ok) return res.status(response.status).json(data);
 
     res.json(data);
   } catch (err) {
@@ -65,17 +62,19 @@ app.get("/api/auth/token", async (req, res) => {
   }
 });
 
-// ✅ Gemini AI endpoint (FIXED model + endpoint)
-app.post(["/api/ai", "/api/ai/"], async (req, res) => {
+// Gemini AI endpoint
+app.post("/api/ai", async (req, res) => {
   try {
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+
     if (!GEMINI_API_KEY) {
       return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
     }
 
     const { text, selection } = req.body || {};
-    if (!text) {
-      return res.status(400).json({ error: "Missing 'text' in request body" });
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "Missing text field" });
     }
 
     const prompt = [
@@ -90,11 +89,9 @@ app.post(["/api/ai", "/api/ai/"], async (req, res) => {
       "Reply clearly and concisely.",
     ].join("\n");
 
-    // ✅ Use a model that works with v1 generateContent
-    // You can override in Render env vars: GEMINI_MODEL
-    const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
-
-    const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      GEMINI_MODEL
+    )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
     const response = await fetch(url, {
       method: "POST",
@@ -109,18 +106,17 @@ app.post(["/api/ai", "/api/ai/"], async (req, res) => {
     if (!response.ok) {
       return res.status(response.status).json({
         error: "Gemini request failed",
-        usedModel: model,
+        model: GEMINI_MODEL,
         details: data,
       });
     }
 
     const answer =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ??
       "No response from Gemini.";
 
-    res.json({ answer, usedModel: model });
+    res.json({ answer, model: GEMINI_MODEL });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "AI request failed", details: String(err) });
   }
 });
