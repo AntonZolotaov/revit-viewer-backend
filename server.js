@@ -62,6 +62,29 @@ app.get("/api/auth/token", async (req, res) => {
   }
 });
 
+// Helper: try to extract JSON from model text safely
+function extractJsonObject(text) {
+  if (!text || typeof text !== "string") return null;
+
+  // If Gemini returns pure JSON
+  try {
+    const direct = JSON.parse(text);
+    if (direct && typeof direct === "object") return direct;
+  } catch {}
+
+  // Otherwise try to find first {...} block
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const slice = text.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+  }
+  return null;
+}
+
 // Gemini AI endpoint
 app.post("/api/ai", async (req, res) => {
   try {
@@ -72,21 +95,57 @@ app.post("/api/ai", async (req, res) => {
       return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
     }
 
-    const { text, selection } = req.body || {};
+    const { text, selection, context } = req.body || {};
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing text field" });
     }
 
-    const prompt = [
-      "You are a BIM assistant for Autodesk APS Viewer.",
-      "",
-      "User question:",
+    // IMPORTANT: we force Gemini to output an "actions" JSON plan the frontend can execute.
+    const systemPrompt = `
+You are a BIM assistant for Autodesk APS Viewer (Forge Viewer).
+Your job: convert the user's request into a JSON response the frontend can execute.
+
+Return ONLY valid JSON (no markdown, no extra text).
+
+Schema:
+{
+  "answer": "short helpful text to show the user",
+  "actions": [
+    {
+      "type": "search_and_isolate",
+      "query": "Windows"
+    }
+  ]
+}
+
+Allowed action types:
+- "search_and_isolate"   (search viewer for query, then isolate + fit + select)
+- "search_and_select"    (search viewer then select + fit, no isolate)
+- "clear_isolation"      (show all)
+- "fit_to_view"          (fit to current selection/scene)
+- "help"                 (no viewer action)
+
+Rules:
+- If user says "show me windows", use: {type:"search_and_isolate", query:"Windows"}.
+- Use simple queries: "Windows", "Doors", "Walls", "Floors", "Columns", etc.
+- If unsure, use type "help" and explain what you can do.
+
+Context you may receive:
+- selection: selected dbIds or element info (optional)
+- context: viewer info (optional)
+
+Now respond with ONLY JSON.
+`.trim();
+
+    const userPrompt = [
+      "User request:",
       text,
       "",
-      "Selected elements (JSON):",
+      "Selection (JSON):",
       JSON.stringify(selection ?? null, null, 2),
       "",
-      "Reply clearly and concisely.",
+      "Context (JSON):",
+      JSON.stringify(context ?? null, null, 2),
     ].join("\n");
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -97,7 +156,14 @@ app.post("/api/ai", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [
+          { role: "user", parts: [{ text: systemPrompt }] },
+          { role: "user", parts: [{ text: userPrompt }] },
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 400,
+        },
       }),
     });
 
@@ -111,11 +177,26 @@ app.post("/api/ai", async (req, res) => {
       });
     }
 
-    const answer =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ??
-      "No response from Gemini.";
+    const rawText =
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-    res.json({ answer, model: GEMINI_MODEL });
+    const parsed = extractJsonObject(rawText);
+
+    if (!parsed) {
+      // fallback: return raw text as answer
+      return res.json({
+        answer: rawText || "No response from Gemini.",
+        actions: [{ type: "help" }],
+        model: GEMINI_MODEL,
+        raw: rawText,
+      });
+    }
+
+    // Normalize
+    const answer = typeof parsed.answer === "string" ? parsed.answer : "";
+    const actions = Array.isArray(parsed.actions) ? parsed.actions : [{ type: "help" }];
+
+    res.json({ answer, actions, model: GEMINI_MODEL });
   } catch (err) {
     res.status(500).json({ error: "AI request failed", details: String(err) });
   }
