@@ -6,7 +6,9 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "2mb" }));
 
+// --------------------
 // CORS
+// --------------------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -15,19 +17,25 @@ app.use((req, res, next) => {
   next();
 });
 
+// --------------------
 // Health check
+// --------------------
 app.get("/", (req, res) => {
   res.send("Revit Viewer Backend is running");
 });
 
+// --------------------
 // Debug route
+// --------------------
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: ["GET /", "GET /api/auth/token", "POST /api/ai"],
   });
 });
 
-// APS Token endpoint
+// --------------------
+// APS Token Endpoint
+// --------------------
 app.get("/api/auth/token", async (req, res) => {
   try {
     const APS_CLIENT_ID = process.env.APS_CLIENT_ID;
@@ -62,30 +70,30 @@ app.get("/api/auth/token", async (req, res) => {
   }
 });
 
-// Helper: try to extract JSON from model text safely
+// --------------------
+// Helper: Extract JSON safely
+// --------------------
 function extractJsonObject(text) {
   if (!text || typeof text !== "string") return null;
 
-  // If Gemini returns pure JSON
   try {
-    const direct = JSON.parse(text);
-    if (direct && typeof direct === "object") return direct;
+    return JSON.parse(text);
   } catch {}
 
-  // Otherwise try to find first {...} block
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start >= 0 && end > start) {
-    const slice = text.slice(start, end + 1);
     try {
-      const parsed = JSON.parse(slice);
-      if (parsed && typeof parsed === "object") return parsed;
+      return JSON.parse(text.slice(start, end + 1));
     } catch {}
   }
+
   return null;
 }
 
-// Gemini AI endpoint
+// --------------------
+// AI Endpoint (Quantity Pro Mode)
+// --------------------
 app.post("/api/ai", async (req, res) => {
   try {
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -100,53 +108,48 @@ app.post("/api/ai", async (req, res) => {
       return res.status(400).json({ error: "Missing text field" });
     }
 
-    // IMPORTANT: we force Gemini to output an "actions" JSON plan the frontend can execute.
     const systemPrompt = `
-You are a BIM assistant for Autodesk APS Viewer (Forge Viewer).
-Your job: convert the user's request into a JSON response the frontend can execute.
+You are a BIM Quantity Assistant for Autodesk APS Viewer.
 
-Return ONLY valid JSON (no markdown, no extra text).
+Return ONLY valid JSON.
 
 Schema:
 {
-  "answer": "short helpful text to show the user",
+  "answer": "short helpful answer",
   "actions": [
     {
-      "type": "search_and_isolate",
-      "query": "Windows"
+      "type": "count_and_isolate",
+      "query": "Doors"
     }
   ]
 }
 
 Allowed action types:
-- "search_and_isolate"   (search viewer for query, then isolate + fit + select)
-- "search_and_select"    (search viewer then select + fit, no isolate)
-- "clear_isolation"      (show all)
-- "fit_to_view"          (fit to current selection/scene)
-- "help"                 (no viewer action)
+- "count_and_isolate" (search, count, isolate, highlight)
+- "search_and_isolate"
+- "search_and_select"
+- "clear_isolation"
+- "fit_to_view"
+- "help"
 
 Rules:
-- If user says "show me windows", use: {type:"search_and_isolate", query:"Windows"}.
-- Use simple queries: "Windows", "Doors", "Walls", "Floors", "Columns", etc.
-- If unsure, use type "help" and explain what you can do.
-
-Context you may receive:
-- selection: selected dbIds or element info (optional)
-- context: viewer info (optional)
-
-Now respond with ONLY JSON.
+- If user says: "how many", "count", "total number", use "count_and_isolate".
+- Use clean Revit categories:
+  Doors, Windows, Walls, Floors, Columns, Roofs, Rooms
+- Keep query simple and plural.
+- If unsure → help.
 `.trim();
 
-    const userPrompt = [
-      "User request:",
-      text,
-      "",
-      "Selection (JSON):",
-      JSON.stringify(selection ?? null, null, 2),
-      "",
-      "Context (JSON):",
-      JSON.stringify(context ?? null, null, 2),
-    ].join("\n");
+    const userPrompt = `
+User request:
+${text}
+
+Selection:
+${JSON.stringify(selection ?? null)}
+
+Context:
+${JSON.stringify(context ?? null)}
+`;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
       GEMINI_MODEL
@@ -161,8 +164,8 @@ Now respond with ONLY JSON.
           { role: "user", parts: [{ text: userPrompt }] },
         ],
         generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 400,
+          temperature: 0.1,
+          maxOutputTokens: 300,
         },
       }),
     });
@@ -172,7 +175,6 @@ Now respond with ONLY JSON.
     if (!response.ok) {
       return res.status(response.status).json({
         error: "Gemini request failed",
-        model: GEMINI_MODEL,
         details: data,
       });
     }
@@ -183,25 +185,29 @@ Now respond with ONLY JSON.
     const parsed = extractJsonObject(rawText);
 
     if (!parsed) {
-      // fallback: return raw text as answer
       return res.json({
         answer: rawText || "No response from Gemini.",
         actions: [{ type: "help" }],
-        model: GEMINI_MODEL,
-        raw: rawText,
       });
     }
 
-    // Normalize
-    const answer = typeof parsed.answer === "string" ? parsed.answer : "";
-    const actions = Array.isArray(parsed.actions) ? parsed.actions : [{ type: "help" }];
+    const answer =
+      typeof parsed.answer === "string"
+        ? parsed.answer
+        : "Processing request...";
 
-    res.json({ answer, actions, model: GEMINI_MODEL });
+    const actions = Array.isArray(parsed.actions)
+      ? parsed.actions
+      : [{ type: "help" }];
+
+    res.json({ answer, actions });
+
   } catch (err) {
     res.status(500).json({ error: "AI request failed", details: String(err) });
   }
 });
 
+// --------------------
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
