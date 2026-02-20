@@ -4,7 +4,7 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 // --------------------
 // CORS
@@ -34,7 +34,7 @@ app.get("/api/routes", (req, res) => {
 });
 
 // --------------------
-// APS Token Endpoint
+// APS Token endpoint
 // --------------------
 app.get("/api/auth/token", async (req, res) => {
   try {
@@ -71,20 +71,25 @@ app.get("/api/auth/token", async (req, res) => {
 });
 
 // --------------------
-// Helper: Extract JSON safely
+// Helper: extract JSON from model output safely
 // --------------------
 function extractJsonObject(text) {
   if (!text || typeof text !== "string") return null;
 
+  // direct JSON
   try {
-    return JSON.parse(text);
+    const direct = JSON.parse(text);
+    if (direct && typeof direct === "object") return direct;
   } catch {}
 
+  // find first {...} block
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start >= 0 && end > start) {
+    const slice = text.slice(start, end + 1);
     try {
-      return JSON.parse(text.slice(start, end + 1));
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === "object") return parsed;
     } catch {}
   }
 
@@ -92,7 +97,7 @@ function extractJsonObject(text) {
 }
 
 // --------------------
-// AI Endpoint (Quantity Pro Mode)
+// Gemini AI endpoint (MAX Quantity Quick Check)
 // --------------------
 app.post("/api/ai", async (req, res) => {
   try {
@@ -108,48 +113,71 @@ app.post("/api/ai", async (req, res) => {
       return res.status(400).json({ error: "Missing text field" });
     }
 
+    /**
+     * IMPORTANT:
+     * - Backend DOES NOT compute quantities.
+     * - It only returns actions for the FRONTEND to execute on real model data.
+     */
     const systemPrompt = `
 You are a BIM Quantity Assistant for Autodesk APS Viewer.
 
-Return ONLY valid JSON.
+Return ONLY valid JSON (no markdown, no extra text).
 
 Schema:
 {
-  "answer": "short helpful answer",
+  "answer": "short message to show user",
   "actions": [
-    {
-      "type": "count_and_isolate",
-      "query": "Doors"
-    }
+    { "type": "...", "...": "..." }
   ]
 }
 
-Allowed action types:
-- "count_and_isolate" (search, count, isolate, highlight)
+Allowed action types (frontend will execute):
+- "count_by_category" 
+  { "type":"count_by_category", "category":"Doors", "mode":"contains" }
+  - Use for: "how many doors", "count windows", etc.
+
+- "sum_properties_all"
+  { "type":"sum_properties_all", "properties":["Length","Area","Volume"], "units":"model" }
+  - Use for: "total length and volume for all elements"
+
+- "sum_properties_by_category"
+  { "type":"sum_properties_by_category", "category":"Walls", "properties":["Area","Volume"], "mode":"contains" }
+  - Use for: "total wall volume", "total floor area"
+
 - "search_and_isolate"
+  { "type":"search_and_isolate", "query":"Doors" }
+
 - "search_and_select"
+  { "type":"search_and_select", "query":"Windows" }
+
 - "clear_isolation"
+  { "type":"clear_isolation" }
+
 - "fit_to_view"
+  { "type":"fit_to_view" }
+
 - "help"
+  { "type":"help" }
 
 Rules:
-- If user says: "how many", "count", "total number", use "count_and_isolate".
-- Use clean Revit categories:
-  Doors, Windows, Walls, Floors, Columns, Roofs, Rooms
-- Keep query simple and plural.
-- If unsure → help.
+- If user asks totals for ALL elements → use "sum_properties_all" with ["Length","Area","Volume"].
+- If user asks total volume/area/length for a category (doors/windows/walls/floors/etc) → use "sum_properties_by_category".
+- If user asks "how many" → use "count_by_category".
+- Categories should be simple Revit names: Doors, Windows, Walls, Floors, Columns, Beams, Rooms, Roofs.
+- mode should be "contains" (frontend will match Category property text).
+- Always produce valid JSON only.
 `.trim();
 
-    const userPrompt = `
-User request:
-${text}
-
-Selection:
-${JSON.stringify(selection ?? null)}
-
-Context:
-${JSON.stringify(context ?? null)}
-`;
+    const userPrompt = [
+      "User request:",
+      text,
+      "",
+      "Selection (JSON):",
+      JSON.stringify(selection ?? null, null, 2),
+      "",
+      "Context (JSON):",
+      JSON.stringify(context ?? null, null, 2),
+    ].join("\n");
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
       GEMINI_MODEL
@@ -165,7 +193,7 @@ ${JSON.stringify(context ?? null)}
         ],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 300,
+          maxOutputTokens: 500,
         },
       }),
     });
@@ -175,39 +203,32 @@ ${JSON.stringify(context ?? null)}
     if (!response.ok) {
       return res.status(response.status).json({
         error: "Gemini request failed",
+        model: GEMINI_MODEL,
         details: data,
       });
     }
 
-    const rawText =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
+    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
     const parsed = extractJsonObject(rawText);
 
     if (!parsed) {
       return res.json({
         answer: rawText || "No response from Gemini.",
         actions: [{ type: "help" }],
+        model: GEMINI_MODEL,
+        raw: rawText,
       });
     }
 
-    const answer =
-      typeof parsed.answer === "string"
-        ? parsed.answer
-        : "Processing request...";
+    const answer = typeof parsed.answer === "string" ? parsed.answer : "OK";
+    const actions = Array.isArray(parsed.actions) ? parsed.actions : [{ type: "help" }];
 
-    const actions = Array.isArray(parsed.actions)
-      ? parsed.actions
-      : [{ type: "help" }];
-
-    res.json({ answer, actions });
-
+    res.json({ answer, actions, model: GEMINI_MODEL });
   } catch (err) {
     res.status(500).json({ error: "AI request failed", details: String(err) });
   }
 });
 
-// --------------------
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
