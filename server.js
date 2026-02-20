@@ -71,18 +71,18 @@ app.get("/api/auth/token", async (req, res) => {
 });
 
 // --------------------
-// Helper: extract JSON from model output safely
+// Helper: safely extract JSON from LLM output
 // --------------------
 function extractJsonObject(text) {
   if (!text || typeof text !== "string") return null;
 
-  // direct JSON
+  // If model returns pure JSON
   try {
     const direct = JSON.parse(text);
     if (direct && typeof direct === "object") return direct;
   } catch {}
 
-  // find first {...} block
+  // Otherwise try first {...} block
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start >= 0 && end > start) {
@@ -115,57 +115,61 @@ app.post("/api/ai", async (req, res) => {
 
     /**
      * IMPORTANT:
-     * - Backend DOES NOT compute quantities.
-     * - It only returns actions for the FRONTEND to execute on real model data.
+     * Backend does NOT compute BIM totals.
+     * It returns action plans for the FRONTEND (APS Viewer) to execute.
      */
     const systemPrompt = `
 You are a BIM Quantity Assistant for Autodesk APS Viewer.
 
-Return ONLY valid JSON (no markdown, no extra text).
+Return ONLY valid JSON. No markdown. No extra text.
 
 Schema:
 {
-  "answer": "short message to show user",
+  "answer": "short message for the user",
   "actions": [
     { "type": "...", "...": "..." }
   ]
 }
 
-Allowed action types (frontend will execute):
-- "count_by_category" 
-  { "type":"count_by_category", "category":"Doors", "mode":"contains" }
-  - Use for: "how many doors", "count windows", etc.
+Allowed action types (frontend will execute on the model):
 
-- "sum_properties_all"
-  { "type":"sum_properties_all", "properties":["Length","Area","Volume"], "units":"model" }
-  - Use for: "total length and volume for all elements"
+1) count_by_category
+   { "type":"count_by_category", "category":"Doors", "mode":"contains" }
+   - Use when user asks: "how many", "count", "number of", "total doors", etc.
+   - Frontend should search/filter by the element Category property.
 
-- "sum_properties_by_category"
-  { "type":"sum_properties_by_category", "category":"Walls", "properties":["Area","Volume"], "mode":"contains" }
-  - Use for: "total wall volume", "total floor area"
+2) sum_properties_all
+   { "type":"sum_properties_all", "properties":["Length","Area","Volume"], "units":"model" }
+   - Use when user asks totals for ALL elements:
+     "total length and volume", "sum all volume", "total area", "all elements totals".
 
-- "search_and_isolate"
-  { "type":"search_and_isolate", "query":"Doors" }
+3) sum_properties_by_category
+   { "type":"sum_properties_by_category", "category":"Walls", "properties":["Area","Volume"], "mode":"contains", "units":"model" }
+   - Use when user asks totals for a specific category:
+     "total wall volume", "total floor area", "sum columns length", etc.
 
-- "search_and_select"
-  { "type":"search_and_select", "query":"Windows" }
+4) search_and_isolate
+   { "type":"search_and_isolate", "query":"Doors" }
 
-- "clear_isolation"
-  { "type":"clear_isolation" }
+5) search_and_select
+   { "type":"search_and_select", "query":"Windows" }
 
-- "fit_to_view"
-  { "type":"fit_to_view" }
+6) clear_isolation
+   { "type":"clear_isolation" }
 
-- "help"
-  { "type":"help" }
+7) fit_to_view
+   { "type":"fit_to_view" }
+
+8) help
+   { "type":"help" }
 
 Rules:
-- If user asks totals for ALL elements → use "sum_properties_all" with ["Length","Area","Volume"].
-- If user asks total volume/area/length for a category (doors/windows/walls/floors/etc) → use "sum_properties_by_category".
-- If user asks "how many" → use "count_by_category".
-- Categories should be simple Revit names: Doors, Windows, Walls, Floors, Columns, Beams, Rooms, Roofs.
-- mode should be "contains" (frontend will match Category property text).
-- Always produce valid JSON only.
+- If the user asks for COUNT -> use count_by_category.
+- If the user asks for TOTAL LENGTH/AREA/VOLUME for ALL elements -> use sum_properties_all with requested properties.
+- If the user asks for TOTAL LENGTH/AREA/VOLUME for a category -> use sum_properties_by_category.
+- Use simple Revit categories: Doors, Windows, Walls, Floors, Columns, Roofs, Rooms, Beams.
+- Use mode: "contains" (frontend will do case-insensitive contains match).
+- Always output valid JSON only.
 `.trim();
 
     const userPrompt = [
@@ -193,7 +197,7 @@ Rules:
         ],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 500,
+          maxOutputTokens: 600,
         },
       }),
     });
