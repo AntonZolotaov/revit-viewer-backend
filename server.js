@@ -21,16 +21,22 @@ app.use((req, res, next) => {
 // Health
 // --------------------
 app.get("/", (req, res) => {
-  res.send("BIM AI Backend Running");
+  res.send("BIM Auth & Intelligence Backend Running");
 });
 
 // --------------------
-// APS Token
+// APS Token (Secure Proxy)
 // --------------------
 app.get("/api/auth/token", async (req, res) => {
   try {
     const APS_CLIENT_ID = process.env.APS_CLIENT_ID;
     const APS_CLIENT_SECRET = process.env.APS_CLIENT_SECRET;
+
+    if (!APS_CLIENT_ID || !APS_CLIENT_SECRET) {
+      return res
+        .status(500)
+        .json({ error: "Missing APS_CLIENT_ID or APS_CLIENT_SECRET" });
+    }
 
     const response = await fetch(
       "https://developer.api.autodesk.com/authentication/v2/token",
@@ -41,237 +47,183 @@ app.get("/api/auth/token", async (req, res) => {
           grant_type: "client_credentials",
           client_id: APS_CLIENT_ID,
           client_secret: APS_CLIENT_SECRET,
-          scope:
-            "data:read data:write data:create bucket:create bucket:read",
+          scope: "data:read data:write data:create bucket:create bucket:read",
         }),
       }
     );
 
     const data = await response.json();
+    if (!response.ok) return res.status(response.status).json(data);
+
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: "Token failed", details: String(err) });
+    res.status(500).json({ error: "Token generation failed", details: String(err) });
   }
 });
 
 // --------------------
 // Helpers
 // --------------------
-function normalize(text) {
-  return String(text || "").toLowerCase();
+function extractJsonObject(text) {
+  if (!text || typeof text !== "string") return null;
+
+  // direct JSON
+  try {
+    const direct = JSON.parse(text);
+    if (direct && typeof direct === "object") return direct;
+  } catch {}
+
+  // try first {...} block
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const slice = text.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+  }
+  return null;
 }
 
-function contains(a, b) {
-  return normalize(a).includes(normalize(b));
-}
+async function fetchWithRetry(url, options, retries = 5) {
+  let delay = 800;
+  let lastErrText = "";
 
-function groupBy(arr, key) {
-  return arr.reduce((acc, item) => {
-    const k = item[key] || "Unknown";
-    if (!acc[k]) acc[k] = [];
-    acc[k].push(item);
-    return acc;
-  }, {});
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+
+      // Read error body once for debugging
+      const errText = await res.text().catch(() => "");
+      lastErrText = `HTTP ${res.status}: ${errText || res.statusText}`;
+
+      // Retry on 429/5xx
+      if (!(res.status === 429 || (res.status >= 500 && res.status <= 599))) {
+        throw new Error(lastErrText);
+      }
+    } catch (e) {
+      if (i === retries - 1) {
+        throw new Error(lastErrText || String(e));
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, delay));
+    delay *= 2;
+  }
+
+  throw new Error(lastErrText || "Request failed");
 }
 
 // --------------------
-// AI / BIM Endpoint
+// Gemini AI / BIM Endpoint
 // --------------------
 app.post("/api/ai", async (req, res) => {
   try {
-    const { text, modelData } = req.body;
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // ✅ set this in Render/host env
+    const GEMINI_MODEL =
+      process.env.GEMINI_MODEL || "gemini-2.5-flash-preview-09-2025";
 
-    if (!text) {
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ error: "Missing GEMINI_API_KEY in environment" });
+    }
+
+    const { text, modelData } = req.body || {};
+    if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing text" });
     }
-
     if (!Array.isArray(modelData)) {
-      return res.json({
-        answer: "Model data not loaded.",
-        dbIds: []
-      });
+      return res.json({ answer: "BIM data not available.", dbIds: [] });
     }
 
-    const q = normalize(text);
+    // Slim & cap data to avoid huge prompts.
+    // If your model is big, keep this lower (e.g. 1500-3000).
+    const MAX_ITEMS = Number(process.env.MAX_BIM_ITEMS || 3000);
 
-    const categories = [
-      "door",
-      "window",
-      "wall",
-      "floor",
-      "column",
-      "roof",
-      "room",
-      "beam"
-    ];
+    const slimData = modelData.slice(0, MAX_ITEMS).map((e) => ({
+      dbId: e.dbId,
+      category: e.category ?? null,
+      level: e.level ?? null,
+      volume: e.volume ?? null,
+      area: e.area ?? null,
+      material: e.material ?? null,
+      name: e.name ?? null,
+      familyType: e.familyType ?? null,
+    }));
 
-    const foundCategory = categories.find(c => q.includes(c));
+    const systemPrompt = `
+You are a BIM Intelligence Agent.
 
-    // -------------------------
-    // SHOW CATEGORY
-    // -------------------------
-    if (q.includes("show") || q.includes("display") || q.includes("find")) {
-      if (foundCategory) {
-        const filtered = modelData.filter(e =>
-          contains(e.category, foundCategory)
-        );
+You MUST answer using ONLY the provided modelData JSON (no guessing).
 
-        return res.json({
-          answer: `Showing ${filtered.length} ${foundCategory}s.`,
-          dbIds: filtered.map(e => e.dbId)
-        });
-      }
-    }
+Return ONLY valid JSON with this schema:
+{
+  "answer": "string",
+  "dbIds": [123, 456]
+}
 
-    // -------------------------
-    // COUNT
-    // -------------------------
-    if (
-      q.includes("how many") ||
-      q.includes("count") ||
-      q.includes("number of")
-    ) {
-      if (foundCategory) {
-        const filtered = modelData.filter(e =>
-          contains(e.category, foundCategory)
-        );
+Rules:
+- If user asks "show/find/display <category>" -> return dbIds of matching items.
+- If user asks "how many/count/number of <category>" -> return count + dbIds.
+- If user asks "total area/volume" optionally with category/material/level filters -> compute accurate sum from data.
+- If level comparison requested -> group by level and compute counts/sums.
 
-        return res.json({
-          answer: `Total ${foundCategory}s: ${filtered.length}`,
-          dbIds: filtered.map(e => e.dbId)
-        });
-      }
-    }
+Here is modelData (array of elements):
+${JSON.stringify(slimData)}
+`.trim();
 
-    // -------------------------
-    // TOTAL VOLUME
-    // -------------------------
-    if (q.includes("total") && q.includes("volume")) {
-      let filtered = modelData;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      GEMINI_MODEL
+    )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
-      if (foundCategory) {
-        filtered = modelData.filter(e =>
-          contains(e.category, foundCategory)
-        );
-      }
-
-      const total = filtered.reduce(
-        (sum, e) => sum + (e.volume || 0),
-        0
-      );
-
-      return res.json({
-        answer: `Total volume: ${total.toFixed(2)}`,
-        dbIds: filtered.map(e => e.dbId)
-      });
-    }
-
-    // -------------------------
-    // TOTAL AREA
-    // -------------------------
-    if (q.includes("total") && q.includes("area")) {
-      let filtered = modelData;
-
-      if (foundCategory) {
-        filtered = modelData.filter(e =>
-          contains(e.category, foundCategory)
-        );
-      }
-
-      const total = filtered.reduce(
-        (sum, e) => sum + (e.area || 0),
-        0
-      );
-
-      return res.json({
-        answer: `Total area: ${total.toFixed(2)}`,
-        dbIds: filtered.map(e => e.dbId)
-      });
-    }
-
-    // -------------------------
-    // WINDOWS PER LEVEL
-    // -------------------------
-    if (q.includes("windows per level")) {
-      const windows = modelData.filter(e =>
-        contains(e.category, "window")
-      );
-
-      const grouped = groupBy(windows, "level");
-
-      let message = "Windows per level:\n";
-      Object.keys(grouped).forEach(level => {
-        message += `${level}: ${grouped[level].length}\n`;
-      });
-
-      return res.json({
-        answer: message,
-        dbIds: windows.map(e => e.dbId)
-      });
-    }
-
-    // -------------------------
-    // COMPARE WINDOWS BETWEEN LEVELS
-    // -------------------------
-    if (q.includes("compare") && q.includes("window")) {
-      const windows = modelData.filter(e =>
-        contains(e.category, "window")
-      );
-
-      const grouped = groupBy(windows, "level");
-      const levels = Object.keys(grouped);
-
-      if (levels.length >= 2) {
-        const l1 = levels[0];
-        const l2 = levels[1];
-
-        return res.json({
-          answer:
-            `${l1}: ${grouped[l1].length} windows\n` +
-            `${l2}: ${grouped[l2].length} windows`,
-          dbIds: windows.map(e => e.dbId)
-        });
-      }
-    }
-
-    // -------------------------
-    // MATERIAL FILTER (Concrete)
-    // -------------------------
-    if (q.includes("concrete")) {
-      const filtered = modelData.filter(e =>
-        contains(e.material, "concrete")
-      );
-
-      const totalVolume = filtered.reduce(
-        (s, e) => s + (e.volume || 0),
-        0
-      );
-
-      return res.json({
-        answer:
-          `Concrete elements: ${filtered.length}\n` +
-          `Total volume: ${totalVolume.toFixed(2)}`,
-        dbIds: filtered.map(e => e.dbId)
-      });
-    }
-
-    // -------------------------
-    // FALLBACK
-    // -------------------------
-    return res.json({
-      answer:
-        "I can calculate counts, totals, per-level breakdowns, show categories, and material quantities.",
-      dbIds: []
+    const aiResponse = await fetchWithRetry(geminiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text }] }],
+        systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 800,
+          // Ask for JSON, but still parse safely in case Gemini adds extra text.
+          responseMimeType: "application/json",
+        },
+      }),
     });
 
+    const result = await aiResponse.json();
+
+    const rawText =
+      result?.candidates?.[0]?.content?.parts?.[0]?.text ??
+      result?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") ??
+      "";
+
+    const parsed = extractJsonObject(rawText);
+
+    if (!parsed) {
+      return res.json({
+        answer: rawText || "No response from AI.",
+        dbIds: [],
+        raw: rawText,
+        model: GEMINI_MODEL,
+      });
+    }
+
+    const answer = typeof parsed.answer === "string" ? parsed.answer : "OK";
+    const dbIds = Array.isArray(parsed.dbIds) ? parsed.dbIds : [];
+
+    res.json({ answer, dbIds, model: GEMINI_MODEL });
   } catch (err) {
     res.status(500).json({
-      error: "AI processing failed",
-      details: String(err)
+      error: "AI reasoning failed",
+      details: String(err),
+      answer: "I encountered an error analyzing the model data.",
+      dbIds: [],
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`BIM Backend active on port ${PORT}`);
 });
