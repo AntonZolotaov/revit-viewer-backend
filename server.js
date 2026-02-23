@@ -41,7 +41,8 @@ app.get("/api/auth/token", async (req, res) => {
           grant_type: "client_credentials",
           client_id: APS_CLIENT_ID,
           client_secret: APS_CLIENT_SECRET,
-          scope: "data:read data:write data:create bucket:create bucket:read",
+          scope:
+            "data:read data:write data:create bucket:create bucket:read",
         }),
       }
     );
@@ -93,21 +94,50 @@ app.post("/api/ai", async (req, res) => {
 
     const q = normalize(text);
 
-    // -------------------------
-    // COUNT BY CATEGORY
-    // -------------------------
-    if (q.includes("how many") || q.includes("count") || q.includes("number of")) {
+    const categories = [
+      "door",
+      "window",
+      "wall",
+      "floor",
+      "column",
+      "roof",
+      "room",
+      "beam"
+    ];
 
-      const categories = ["door", "window", "wall", "floor", "column", "roof", "room", "beam"];
-      const found = categories.find(c => q.includes(c));
+    const foundCategory = categories.find(c => q.includes(c));
 
-      if (found) {
+    // -------------------------
+    // SHOW CATEGORY
+    // -------------------------
+    if (q.includes("show") || q.includes("display") || q.includes("find")) {
+      if (foundCategory) {
         const filtered = modelData.filter(e =>
-          contains(e.category, found)
+          contains(e.category, foundCategory)
         );
 
         return res.json({
-          answer: `Total ${found}s: ${filtered.length}`,
+          answer: `Showing ${filtered.length} ${foundCategory}s.`,
+          dbIds: filtered.map(e => e.dbId)
+        });
+      }
+    }
+
+    // -------------------------
+    // COUNT
+    // -------------------------
+    if (
+      q.includes("how many") ||
+      q.includes("count") ||
+      q.includes("number of")
+    ) {
+      if (foundCategory) {
+        const filtered = modelData.filter(e =>
+          contains(e.category, foundCategory)
+        );
+
+        return res.json({
+          answer: `Total ${foundCategory}s: ${filtered.length}`,
           dbIds: filtered.map(e => e.dbId)
         });
       }
@@ -117,16 +147,18 @@ app.post("/api/ai", async (req, res) => {
     // TOTAL VOLUME
     // -------------------------
     if (q.includes("total") && q.includes("volume")) {
-
       let filtered = modelData;
 
-      const categories = ["wall", "floor", "column", "roof"];
-      const found = categories.find(c => q.includes(c));
-      if (found) {
-        filtered = modelData.filter(e => contains(e.category, found));
+      if (foundCategory) {
+        filtered = modelData.filter(e =>
+          contains(e.category, foundCategory)
+        );
       }
 
-      const total = filtered.reduce((sum, e) => sum + (e.volume || 0), 0);
+      const total = filtered.reduce(
+        (sum, e) => sum + (e.volume || 0),
+        0
+      );
 
       return res.json({
         answer: `Total volume: ${total.toFixed(2)}`,
@@ -138,16 +170,18 @@ app.post("/api/ai", async (req, res) => {
     // TOTAL AREA
     // -------------------------
     if (q.includes("total") && q.includes("area")) {
-
       let filtered = modelData;
 
-      const categories = ["wall", "floor", "roof"];
-      const found = categories.find(c => q.includes(c));
-      if (found) {
-        filtered = modelData.filter(e => contains(e.category, found));
+      if (foundCategory) {
+        filtered = modelData.filter(e =>
+          contains(e.category, foundCategory)
+        );
       }
 
-      const total = filtered.reduce((sum, e) => sum + (e.area || 0), 0);
+      const total = filtered.reduce(
+        (sum, e) => sum + (e.area || 0),
+        0
+      );
 
       return res.json({
         answer: `Total area: ${total.toFixed(2)}`,
@@ -159,7 +193,6 @@ app.post("/api/ai", async (req, res) => {
     // WINDOWS PER LEVEL
     // -------------------------
     if (q.includes("windows per level")) {
-
       const windows = modelData.filter(e =>
         contains(e.category, "window")
       );
@@ -178,16 +211,14 @@ app.post("/api/ai", async (req, res) => {
     }
 
     // -------------------------
-    // COMPARE LEVELS
+    // COMPARE WINDOWS BETWEEN LEVELS
     // -------------------------
     if (q.includes("compare") && q.includes("window")) {
-
       const windows = modelData.filter(e =>
         contains(e.category, "window")
       );
 
       const grouped = groupBy(windows, "level");
-
       const levels = Object.keys(grouped);
 
       if (levels.length >= 2) {
@@ -195,25 +226,31 @@ app.post("/api/ai", async (req, res) => {
         const l2 = levels[1];
 
         return res.json({
-          answer: `${l1}: ${grouped[l1].length} windows\n${l2}: ${grouped[l2].length} windows`,
+          answer:
+            `${l1}: ${grouped[l1].length} windows\n` +
+            `${l2}: ${grouped[l2].length} windows`,
           dbIds: windows.map(e => e.dbId)
         });
       }
     }
 
     // -------------------------
-    // MATERIAL FILTER
+    // MATERIAL FILTER (Concrete)
     // -------------------------
     if (q.includes("concrete")) {
-
       const filtered = modelData.filter(e =>
         contains(e.material, "concrete")
       );
 
-      const totalVolume = filtered.reduce((s, e) => s + (e.volume || 0), 0);
+      const totalVolume = filtered.reduce(
+        (s, e) => s + (e.volume || 0),
+        0
+      );
 
       return res.json({
-        answer: `Concrete elements: ${filtered.length}\nTotal volume: ${totalVolume.toFixed(2)}`,
+        answer:
+          `Concrete elements: ${filtered.length}\n` +
+          `Total volume: ${totalVolume.toFixed(2)}`,
         dbIds: filtered.map(e => e.dbId)
       });
     }
@@ -222,7 +259,8 @@ app.post("/api/ai", async (req, res) => {
     // FALLBACK
     // -------------------------
     return res.json({
-      answer: "I can calculate counts, totals, per-level breakdowns, and material quantities.",
+      answer:
+        "I can calculate counts, totals, per-level breakdowns, show categories, and material quantities.",
       dbIds: []
     });
 
