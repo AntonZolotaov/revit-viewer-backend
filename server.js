@@ -25,7 +25,7 @@ app.get("/", (req, res) => {
 });
 
 // --------------------
-// APS Token
+// APS Token (FIXED: includes viewables:read)
 // --------------------
 app.get("/api/auth/token", async (req, res) => {
   try {
@@ -45,7 +45,8 @@ app.get("/api/auth/token", async (req, res) => {
           grant_type: "client_credentials",
           client_id: APS_CLIENT_ID,
           client_secret: APS_CLIENT_SECRET,
-          scope: "data:read data:write data:create bucket:create bucket:read",
+          // ✅ IMPORTANT: viewables:read is required for Viewer Document.load
+          scope: "data:read viewables:read data:write data:create bucket:create bucket:read",
         }),
       }
     );
@@ -62,8 +63,13 @@ app.get("/api/auth/token", async (req, res) => {
 // --------------------
 // Helpers
 // --------------------
-const norm = (s) => String(s ?? "").toLowerCase().trim();
-const contains = (a, b) => norm(a).includes(norm(b));
+function norm(s) {
+  return String(s ?? "").toLowerCase().trim();
+}
+
+function contains(hay, needle) {
+  return norm(hay).includes(norm(needle));
+}
 
 function safeNumber(v) {
   if (v == null) return 0;
@@ -81,59 +87,111 @@ function groupBy(arr, keyFn) {
   return m;
 }
 
+function extractJsonObject(text) {
+  if (!text || typeof text !== "string") return null;
+
+  try {
+    const direct = JSON.parse(text);
+    if (direct && typeof direct === "object") return direct;
+  } catch {}
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const slice = text.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+  }
+  return null;
+}
+
+async function fetchWithRetry(url, options, retries = 5) {
+  let delay = 800;
+  let lastErrText = "";
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+
+      const errText = await res.text().catch(() => "");
+      lastErrText = `HTTP ${res.status}: ${errText || res.statusText}`;
+
+      if (!(res.status === 429 || (res.status >= 500 && res.status <= 599))) {
+        throw new Error(lastErrText);
+      }
+    } catch (e) {
+      if (i === retries - 1) throw new Error(lastErrText || String(e));
+    }
+    await new Promise((r) => setTimeout(r, delay));
+    delay *= 2;
+  }
+  throw new Error(lastErrText || "Request failed");
+}
+
 // --------------------
-// AI PLANNER (Gemini optional)
+// AI: convert text -> query plan (NO model data in prompt)
 // --------------------
 async function llmMakePlan(text) {
   const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
   const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 
-  if (!GEMINI_API_KEY) {
-    return fallbackPlan(text);
-  }
+  // no AI key -> fallback simple plan
+  if (!GEMINI_API_KEY) return fallbackPlan(text);
 
   const systemPrompt = `
 You are a BIM query planner.
-Return ONLY JSON.
+
+Return ONLY valid JSON (no markdown) in this schema:
 
 {
   "intent": "show|count|sum|breakdown|compare|help",
-  "category": "Doors|Windows|Walls|Floors|Columns|Roofs|Rooms|Beams|Any",
-  "property": "area|volume",
-  "material": "string",
-  "level": "string",
-  "groupBy": "level",
-  "compareLevels": ["Level 1","Level 2"]
+  "category": "Doors|Windows|Walls|Floors|Columns|Roofs|Rooms|Beams|Any" (optional),
+  "property": "area|volume" (optional, for sum),
+  "material": "string" (optional),
+  "level": "string" (optional),
+  "groupBy": "level" (optional, for breakdown),
+  "compareLevels": ["Level 1","Level 2"] (optional, for compare)
 }
+
+Rules:
+- If user says "show/find/display" -> intent "show"
+- If user says "how many/count/number of" -> intent "count"
+- If user says "total/sum" + "area/volume" -> intent "sum" with property
+- If user says "per level/by level" -> intent "breakdown" with groupBy "level"
+- If user says "compare X vs Y" -> intent "compare" with compareLevels
+- category should be a simple Revit category when possible.
+- If unclear -> intent "help"
 `.trim();
 
-  try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text }] }],
-          systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
-        }),
-      }
-    );
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_MODEL
+  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
-    const data = await resp.json();
-    const raw =
-      data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
+  const resp = await fetchWithRetry(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text }] }],
+      systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 400,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
 
-    const jsonStart = raw.indexOf("{");
-    const jsonEnd = raw.lastIndexOf("}");
-    if (jsonStart >= 0 && jsonEnd > jsonStart) {
-      return JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
-    }
-  } catch (e) {
-    console.log("Gemini fallback:", e.message);
-  }
+  const data = await resp.json();
+  const rawText =
+    data?.candidates?.[0]?.content?.parts?.[0]?.text ??
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") ??
+    "";
 
-  return fallbackPlan(text);
+  const plan = extractJsonObject(rawText);
+  return plan || fallbackPlan(text);
 }
 
 // --------------------
@@ -141,17 +199,16 @@ Return ONLY JSON.
 // --------------------
 function fallbackPlan(text) {
   const t = norm(text);
-
   const plan = { intent: "help", category: "Any" };
 
-  if (t.includes("how many") || t.includes("count")) plan.intent = "count";
+  if (t.includes("show") || t.includes("find") || t.includes("display")) plan.intent = "show";
+  if (t.includes("how many") || t.includes("count") || t.includes("number of")) plan.intent = "count";
   if (t.includes("total") || t.includes("sum")) plan.intent = "sum";
   if (t.includes("per level") || t.includes("by level")) {
     plan.intent = "breakdown";
     plan.groupBy = "level";
   }
   if (t.includes("compare")) plan.intent = "compare";
-  if (t.includes("show")) plan.intent = "show";
 
   if (t.includes("door")) plan.category = "Doors";
   if (t.includes("window")) plan.category = "Windows";
@@ -162,97 +219,108 @@ function fallbackPlan(text) {
   if (t.includes("beam")) plan.category = "Beams";
   if (t.includes("room")) plan.category = "Rooms";
 
-  if (t.includes("volume")) plan.property = "volume";
-  if (t.includes("area")) plan.property = "area";
+  if (t.includes("volume") || t.includes("m3") || t.includes("m³")) plan.property = "volume";
+  if (t.includes("area") || t.includes("m2") || t.includes("m²")) plan.property = "area";
 
   if (t.includes("concrete")) plan.material = "concrete";
+
+  // very naive: try to detect "Level X"
+  const m = text.match(/level\s*([0-9]+|[a-z]+)/i);
+  if (m) plan.level = `Level ${m[1]}`;
+
+  // naive compare: "Level 1 vs Level 2"
+  const cmp = text.match(/level\s*([0-9a-z]+)\s*(?:vs|versus)\s*level\s*([0-9a-z]+)/i);
+  if (cmp) plan.compareLevels = [`Level ${cmp[1]}`, `Level ${cmp[2]}`];
 
   return plan;
 }
 
 // --------------------
-// Filter
+// Execute plan on FULL modelData (accurate)
+// modelData item schema expected:
+// { dbId:number, category:string, level:string, material:string, area:number, volume:number }
 // --------------------
 function filterElements(modelData, plan) {
   let arr = modelData;
 
-  if (plan.category && plan.category !== "Any") {
+  if (plan?.category && plan.category !== "Any") {
     const c = norm(plan.category);
-    arr = arr.filter(
-      (e) =>
-        contains(e.category, c) ||
-        contains(e.category, c.replace(/s$/, ""))
-    );
+    arr = arr.filter((e) => contains(e.category, c) || contains(e.category, c.replace(/s$/, "")));
   }
 
-  if (plan.material) {
-    arr = arr.filter((e) => contains(e.material, plan.material));
+  if (plan?.material) {
+    const m = norm(plan.material);
+    arr = arr.filter((e) => contains(e.material, m));
   }
 
-  if (plan.level) {
-    arr = arr.filter((e) => contains(e.level, plan.level));
+  if (plan?.level) {
+    const lv = norm(plan.level);
+    arr = arr.filter((e) => contains(e.level, lv));
   }
 
   return arr;
 }
 
-// --------------------
-// Execute Plan
-// --------------------
 function runPlan(modelData, plan) {
-  const intent = norm(plan.intent);
-  const working = filterElements(modelData, plan);
+  const intent = norm(plan?.intent);
 
-  if (intent === "show") {
-    return { answer: `Showing ${working.length} elements.`, dbIds: working.map(e => e.dbId) };
-  }
-
-  if (intent === "count") {
-    return { answer: `Count: ${working.length}`, dbIds: working.map(e => e.dbId) };
-  }
-
-  if (intent === "sum") {
-    const field = plan.property;
-    if (!field) return { answer: "Specify area or volume.", dbIds: [] };
-
-    const total = working.reduce((s, e) => s + safeNumber(e[field]), 0);
+  if (!intent || intent === "help") {
     return {
-      answer: `Total ${field}: ${total.toFixed(2)}`,
-      dbIds: working.map(e => e.dbId)
+      answer:
+        "Try: 'Show doors', 'How many windows?', 'Total wall volume', 'Windows per level', 'Compare window count Level 1 vs Level 2', 'Total concrete volume'.",
+      dbIds: [],
     };
   }
 
+  const working = filterElements(modelData, plan);
+
+  if (intent === "show") {
+    return { answer: `Showing ${working.length} elements.`, dbIds: working.map((e) => e.dbId) };
+  }
+
+  if (intent === "count") {
+    return { answer: `Count: ${working.length}`, dbIds: working.map((e) => e.dbId) };
+  }
+
+  if (intent === "sum") {
+    const prop = norm(plan?.property);
+    const field = prop === "area" ? "area" : prop === "volume" ? "volume" : null;
+    if (!field) return { answer: "Specify 'area' or 'volume' (e.g. 'total wall volume').", dbIds: [] };
+
+    const total = working.reduce((s, e) => s + safeNumber(e[field]), 0);
+    return { answer: `Total ${field}: ${total.toFixed(2)}`, dbIds: working.map((e) => e.dbId) };
+  }
+
   if (intent === "breakdown") {
-    const g = groupBy(working, e => e.level || "Unknown");
-    const lines = [...g.entries()]
-      .map(([lvl, items]) => `${lvl}: ${items.length}`)
-      .sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+    const groupByKey = norm(plan?.groupBy);
+    if (groupByKey !== "level") return { answer: "I can breakdown by level (try 'windows per level').", dbIds: [] };
+
+    const g = groupBy(working, (e) => e.level || "Unknown");
+    const lines = [];
+    for (const [lvl, items] of g.entries()) lines.push(`${lvl}: ${items.length}`);
+    lines.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
     return {
       answer: lines.length ? `Per level:\n${lines.join("\n")}` : "No matching elements.",
-      dbIds: working.map(e => e.dbId)
+      dbIds: working.map((e) => e.dbId),
     };
   }
 
   if (intent === "compare") {
-    const levels = plan.compareLevels || [];
-    if (levels.length < 2) {
-      return { answer: "Specify two levels to compare.", dbIds: [] };
-    }
+    const levels = Array.isArray(plan?.compareLevels) ? plan.compareLevels : [];
+    if (levels.length < 2) return { answer: "Specify two levels to compare (e.g. 'Level 1 vs Level 2').", dbIds: [] };
 
-    const a = working.filter(e => contains(e.level, levels[0]));
-    const b = working.filter(e => contains(e.level, levels[1]));
+    const l1 = levels[0], l2 = levels[1];
+    const a = working.filter((e) => contains(e.level, l1));
+    const b = working.filter((e) => contains(e.level, l2));
 
     return {
-      answer: `${levels[0]}: ${a.length}\n${levels[1]}: ${b.length}`,
-      dbIds: [...new Set([...a, ...b].map(e => e.dbId))]
+      answer: `${l1}: ${a.length}\n${l2}: ${b.length}`,
+      dbIds: [...new Set([...a, ...b].map((e) => e.dbId))],
     };
   }
 
-  return {
-    answer: "Try: 'How many windows?', 'Total concrete volume', 'Windows per level'.",
-    dbIds: []
-  };
+  return { answer: "Unsupported request. Try 'how many doors' or 'total wall volume'.", dbIds: [] };
 }
 
 // --------------------
@@ -260,11 +328,9 @@ function runPlan(modelData, plan) {
 // --------------------
 app.post("/api/ai", async (req, res) => {
   try {
-    const { text, modelData } = req.body;
-
-    if (!text) return res.status(400).json({ error: "Missing text" });
-    if (!Array.isArray(modelData))
-      return res.json({ answer: "Model data missing.", dbIds: [] });
+    const { text, modelData } = req.body || {};
+    if (!text || typeof text !== "string") return res.status(400).json({ error: "Missing text" });
+    if (!Array.isArray(modelData)) return res.json({ answer: "BIM data not available.", dbIds: [] });
 
     const plan = await llmMakePlan(text);
     const result = runPlan(modelData, plan);
@@ -274,7 +340,8 @@ app.post("/api/ai", async (req, res) => {
     res.status(500).json({
       error: "AI reasoning failed",
       details: String(err),
-      dbIds: []
+      answer: "I encountered an error analyzing the model data.",
+      dbIds: [],
     });
   }
 });
